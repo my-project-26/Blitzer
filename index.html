@@ -22,14 +22,16 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font-family
 #banner.l50{background:var(--warn);animation:blink .35s infinite alternate}
 @keyframes blink{to{filter:brightness(1.6)}}
 #map{flex:1;margin:8px;border-radius:12px;min-height:200px}
-#bar{display:flex;gap:8px;padding:0 8px 8px}
+.bar{display:flex;gap:8px;padding:0 8px 8px}
 button{flex:1;padding:12px 6px;border:0;border-radius:12px;background:var(--acc);color:#fff;font-size:13px;font-weight:600}
 button.off{background:var(--card);color:var(--mut)}
 button.mob{background:var(--pink)}
-#legend{display:flex;justify-content:center;gap:16px;font-size:12px;color:var(--mut);padding:0 8px 6px}
+button.active{background:var(--orange);color:#000}
+#legend{display:flex;justify-content:center;gap:16px;font-size:12px;color:var(--mut);padding:0 8px 4px}
 .dot{display:inline-block;width:12px;height:12px;border-radius:50%;vertical-align:-1px;margin-right:4px}
 .dot.red{border:3px solid var(--warn);background:rgba(255,59,48,.25)}
 .dot.pink{background:var(--pink)}
+#status{font-size:11px;color:var(--mut);text-align:center;padding:0 12px 4px}
 #info{font-size:11px;color:var(--mut);text-align:center;padding:0 12px 8px}
 </style>
 </head>
@@ -46,13 +48,17 @@ button.mob{background:var(--pink)}
     <span><span class="dot red"></span>fester Blitzer</span>
     <span><span class="dot pink"></span>mobiler Blitzer (gemeldet)</span>
   </div>
-  <div id="bar">
+  <div class="bar">
     <button id="start">Start</button>
     <button id="snd">Ton: an</button>
     <button id="voice">Sprache: an</button>
-    <button id="report" class="mob">Mobil melden</button>
   </div>
-  <div id="info">Warnung bei 500 m, 150 m und 50 m. Feste Blitzer: OpenStreetMap (nicht vollständig). Mobile Blitzer gibt es dort nicht – pinke Punkte sind nur die, die du selbst meldest (4 Stunden gültig, nur auf diesem Gerät gespeichert). Die Nutzung von Blitzerwarnern durch Fahrer ist in Deutschland verboten.</div>
+  <div class="bar">
+    <button id="report" class="mob">Mobil melden (hier)</button>
+    <button id="addfix">Fest eintragen</button>
+  </div>
+  <div id="status">OpenStreetMap: noch nicht geladen</div>
+  <div id="info">Warnung bei 500 m, 150 m und 50 m. Läuft nur, solange diese Seite offen ist. Feste Blitzer: OpenStreetMap (unvollständig) plus deine eigenen Einträge. Mobile Blitzer: nur deine Meldungen (4 Stunden gültig). Alles Eigene ist nur auf diesem Gerät gespeichert. Punkt antippen = entfernen. Die Nutzung von Blitzerwarnern durch Fahrer ist in Deutschland verboten.</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -64,7 +70,7 @@ button.mob{background:var(--pink)}
   var LEVELS = [500,150,50];    // m, Warnstufen
   var RESET_DIST = 650;         // m, ab hier wird die Warnung für einen Blitzer zurückgesetzt
   var CONE = 60;                // Grad, nur Blitzer vor dir
-  var MOBILE_TTL = 4*60*60*1000; // 4 Stunden gültig
+  var MOBILE_TTL = 4*60*60*1000; // mobile Meldungen 4 Stunden gültig
   var STORE_KEY = 'mobilBlitzer';
   var OVERPASS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
 
@@ -75,15 +81,16 @@ button.mob{background:var(--pink)}
   var meMarker = L.circleMarker([0,0],{radius:8,color:'#fff',weight:2,fillColor:'#3b82f6',fillOpacity:1}).addTo(map);
   var rangeCircle = L.circle([0,0],{radius:SHOW_RADIUS,color:'#3b82f6',weight:1,dashArray:'6 6',fill:false,interactive:false}).addTo(map);
   var camLayer = L.layerGroup().addTo(map);
-  var cams = [];                // {id,lat,lon,maxspeed,type:'fixed'|'mobile',t}
-  var markers = {};             // id -> Leaflet-Marker (nur Blitzer im 1-km-Umkreis)
+  var cams = [];                // {id,lat,lon,maxspeed,type:'fixed'|'mobile',t,own}
+  var markers = {};
   var seen = {};
   var lastFetch = null;
   var lastPos = null;
   var heading = null;
   var follow = true;
+  var addMode = false;
   var soundOn = true, voiceOn = true;
-  var announced = {};           // id -> kleinste bereits gewarnte Stufe
+  var announced = {};
   var gpsFound = false;
   var gpsMsgUntil = 0;
   var watchId = null, wakeLock = null, audioCtx = null;
@@ -104,19 +111,21 @@ button.mob{background:var(--pink)}
   }
   function angDiff(a,b){var d=Math.abs(a-b)%360;return d>180?360-d:d;}
 
-  // ---------- Mobile Blitzer (selbst gemeldet, lokal gespeichert) ----------
-  function saveMobile(){
+  // ---------- Eigene Einträge (mobil gemeldet + selbst eingetragene feste), lokal gespeichert ----------
+  function saveOwn(){
     try{
-      var list=cams.filter(function(c){return c.type==='mobile';}).map(function(c){return {id:c.id,lat:c.lat,lon:c.lon,t:c.t};});
+      var list=cams.filter(function(c){return c.own;}).map(function(c){return {id:c.id,lat:c.lat,lon:c.lon,t:c.t,type:c.type};});
       localStorage.setItem(STORE_KEY,JSON.stringify(list));
     }catch(e){}
   }
-  function loadMobile(){
+  function loadOwn(){
     try{
       var raw=localStorage.getItem(STORE_KEY);
       if(!raw)return;
       JSON.parse(raw).forEach(function(m){
-        if(Date.now()-m.t<MOBILE_TTL)cams.push({id:m.id,lat:m.lat,lon:m.lon,maxspeed:null,type:'mobile',t:m.t});
+        var type=m.type||'mobile';
+        if(type==='mobile'&&Date.now()-m.t>=MOBILE_TTL)return;
+        cams.push({id:m.id,lat:m.lat,lon:m.lon,maxspeed:null,type:type,t:m.t||0,own:true});
       });
     }catch(e){}
   }
@@ -124,7 +133,7 @@ button.mob{background:var(--pink)}
     cams=cams.filter(function(c){return c.id!==id;});
     if(markers[id]){camLayer.removeLayer(markers[id]);delete markers[id];}
     delete announced[id];
-    saveMobile();
+    saveOwn();
     check();
   }
   function expireMobile(){
@@ -136,22 +145,28 @@ button.mob{background:var(--pink)}
         changed=true;
       }
     });
-    if(changed)saveMobile();
+    if(changed)saveOwn();
   }
 
   // ---------- Karte: Marker nur im 1-km-Umkreis ----------
   function popupFor(c){
     var div=document.createElement('div');
+    var text;
     if(c.type==='mobile'){
       var min=Math.max(0,Math.round((Date.now()-c.t)/60000));
-      div.appendChild(document.createTextNode('Mobiler Blitzer – vor '+min+' Min. gemeldet'));
+      text='Mobiler Blitzer – vor '+min+' Min. gemeldet';
+    }else if(c.own){
+      text='Eigener fester Blitzer';
+    }else{
+      text='Fester Blitzer (OpenStreetMap)'+(c.maxspeed?' – Tempo '+c.maxspeed:'');
+    }
+    div.appendChild(document.createTextNode(text));
+    if(c.own){
       var btn=document.createElement('button');
       btn.textContent='Entfernen';
       btn.style.cssText='display:block;margin-top:6px;padding:6px 10px;font-size:13px;flex:none';
       btn.onclick=function(){removeCam(c.id);};
       div.appendChild(btn);
-    }else{
-      div.appendChild(document.createTextNode('Fester Blitzer'+(c.maxspeed?' – Tempo '+c.maxspeed:'')));
     }
     return div;
   }
@@ -246,22 +261,25 @@ button.mob{background:var(--pink)}
     var q='[out:json][timeout:25];(node["highway"="speed_camera"](around:'+RADIUS+','+lat+','+lon+');node["enforcement"="maxspeed"](around:'+RADIUS+','+lat+','+lon+'););out body;';
     for(var i=0;i<OVERPASS.length;i++){
       try{
-        var res=await fetch(OVERPASS[i],{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+        var ctrl=new AbortController();
+        var to=setTimeout(function(){ctrl.abort();},20000);
+        var res=await fetch(OVERPASS[i],{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'},signal:ctrl.signal});
+        clearTimeout(to);
         if(!res.ok)continue;
         var j=await res.json();
         j.elements.forEach(function(e){
           var id='n'+e.id;
           if(seen[id])return;
           seen[id]=true;
-          cams.push({id:id,lat:e.lat,lon:e.lon,maxspeed:(e.tags&&e.tags.maxspeed)||null,type:'fixed',t:0});
+          cams.push({id:id,lat:e.lat,lon:e.lon,maxspeed:(e.tags&&e.tags.maxspeed)||null,type:'fixed',t:0,own:false});
         });
+        $('status').textContent='OpenStreetMap: '+j.elements.length+' feste Blitzer im 5-km-Umkreis geladen'+(j.elements.length===0?' – bekannte Blitzer kannst du selbst eintragen':'');
         lastFetch={lat:lat,lon:lon};
         return true;
       }catch(e){}
     }
     lastFetch=null; // beim nächsten GPS-Update erneut versuchen
-    $('banner').className='';
-    $('banner').textContent='Blitzerdaten konnten nicht geladen werden';
+    $('status').textContent='OpenStreetMap-Abruf fehlgeschlagen – neuer Versuch beim nächsten GPS-Signal';
     return false;
   }
 
@@ -287,7 +305,7 @@ button.mob{background:var(--pink)}
     if(follow)map.setView([lat,lon],Math.max(map.getZoom(),14));
 
     if(!lastFetch||dist(lastFetch.lat,lastFetch.lon,lat,lon)>REFETCH){
-      lastFetch={lat:lat,lon:lon}; // Doppelabruf verhindern
+      lastFetch={lat:lat,lon:lon};
       fetchCams(lat,lon).then(check);
     }
     check();
@@ -376,6 +394,7 @@ button.mob{background:var(--pink)}
     voiceOn=!voiceOn;this.textContent='Sprache: '+(voiceOn?'an':'aus');this.className=voiceOn?'':'off';
     if(voiceOn){unlockAudio();speak('Sprachwarnung aktiv');}
   };
+
   // Mobilen Blitzer an der aktuellen Position melden
   $('report').onclick=function(){
     if(!lastPos){
@@ -383,19 +402,49 @@ button.mob{background:var(--pink)}
       $('banner').textContent='Erst „Start“ tippen und auf GPS warten';
       return;
     }
-    var c={id:'m'+Date.now(),lat:lastPos.lat,lon:lastPos.lon,maxspeed:null,type:'mobile',t:Date.now()};
+    var c={id:'m'+Date.now(),lat:lastPos.lat,lon:lastPos.lon,maxspeed:null,type:'mobile',t:Date.now(),own:true};
     cams.push(c);
     announced[c.id]=LEVELS[LEVELS.length-1]; // nicht sofort selbst warnen
-    saveMobile();
+    saveOwn();
     check();
     $('banner').className='ok';
     $('banner').textContent='✓ Mobiler Blitzer gemeldet';
     gpsMsgUntil=Date.now()+3000;
     if(navigator.vibrate)navigator.vibrate(100);
   };
+
+  // Festen Blitzer selbst eintragen: Button tippen, dann auf die Karte tippen
+  $('addfix').onclick=function(){
+    addMode=!addMode;
+    this.className=addMode?'active':'';
+    this.textContent=addMode?'Jetzt Karte tippen …':'Fest eintragen';
+    if(addMode){
+      follow=false;
+      $('banner').className='';
+      $('banner').textContent='Tippe auf die Karte, wo der Blitzer steht';
+    }
+  };
+  map.on('click',function(e){
+    if(!addMode)return;
+    addMode=false;
+    var btn=$('addfix');btn.className='';btn.textContent='Fest eintragen';
+    var c={id:'f'+Date.now(),lat:e.latlng.lat,lon:e.latlng.lng,maxspeed:null,type:'fixed',t:0,own:true};
+    cams.push(c);
+    saveOwn();
+    markers[c.id]=makeMarker(c);
+    markers[c.id].addTo(camLayer);
+    $('banner').className='ok';
+    $('banner').textContent='✓ Fester Blitzer eingetragen';
+    gpsMsgUntil=Date.now()+3000;
+    if(lastPos)check();
+  });
   map.on('dblclick',function(){follow=true;});
 
-  loadMobile();
+  loadOwn();
+  // gespeicherte eigene Blitzer sofort auf der Karte zeigen, auch vor dem Start
+  cams.forEach(function(c){
+    if(map.getBounds().contains([c.lat,c.lon])){markers[c.id]=makeMarker(c);markers[c.id].addTo(camLayer);}
+  });
 })();
 </script>
 </body>
