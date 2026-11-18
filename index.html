@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Blitzer-Warner</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--bg:#0f1115;--card:#1a1d24;--txt:#f2f4f8;--mut:#8b93a3;--ok:#2ecc71;--warn:#ff3b30;--orange:#ff9500;--acc:#3b82f6}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font-family:-apple-system,system-ui,sans-serif}
+#app{display:flex;flex-direction:column;height:100%;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+#top{display:flex;gap:8px;padding:8px;align-items:stretch}
+.box{background:var(--card);border-radius:12px;padding:8px 12px;flex:1;text-align:center}
+.box b{display:block;font-size:26px}
+.box small{color:var(--mut);font-size:11px}
+#banner{margin:0 8px;padding:12px;border-radius:12px;background:var(--card);text-align:center;font-size:20px;font-weight:700}
+#banner.l500{background:var(--orange);color:#000}
+#banner.l150{background:var(--warn)}
+#banner.l50{background:var(--warn);animation:blink .35s infinite alternate}
+@keyframes blink{to{filter:brightness(1.6)}}
+#map{flex:1;margin:8px;border-radius:12px;min-height:200px}
+#bar{display:flex;gap:8px;padding:0 8px 8px}
+button{flex:1;padding:12px;border:0;border-radius:12px;background:var(--acc);color:#fff;font-size:15px;font-weight:600}
+button.off{background:var(--card);color:var(--mut)}
+#info{font-size:11px;color:var(--mut);text-align:center;padding:0 12px 8px}
+.cam{font-size:22px;text-align:center;line-height:1}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="top">
+    <div class="box"><b id="spd">–</b><small>km/h</small></div>
+    <div class="box"><b id="near">–</b><small>nächster Blitzer</small></div>
+    <div class="box"><b id="cnt">0</b><small>Blitzer im Umkreis</small></div>
+  </div>
+  <div id="banner">Tippe auf „Start“ und erlaube den Standort</div>
+  <div id="map"></div>
+  <div id="bar">
+    <button id="start">Start</button>
+    <button id="snd">Ton: an</button>
+    <button id="voice">Sprache: an</button>
+  </div>
+  <div id="info">Warnung bei 500 m, 150 m und 50 m. Daten: OpenStreetMap (feste Blitzer, nicht vollständig, keine mobilen Kontrollen). Die Nutzung von Blitzerwarnern durch Fahrer ist in Deutschland verboten – nur als Beifahrer oder zur Routenplanung nutzen.</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+  var RADIUS = 5000;            // m, Abrufradius für Blitzerdaten
+  var REFETCH = 2000;           // m, neu laden nach so viel Bewegung
+  var LEVELS = [500,150,50];    // m, Warnstufen
+  var RESET_DIST = 650;         // m, ab hier wird die Warnung für einen Blitzer zurückgesetzt
+  var CONE = 60;                // Grad, nur Blitzer vor dir
+  var OVERPASS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+
+  var $ = function(id){return document.getElementById(id);};
+  var map = L.map('map',{zoomControl:false}).setView([48.06,8.53],13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(map);
+
+  var meMarker = L.circleMarker([0,0],{radius:8,color:'#fff',weight:2,fillColor:'#3b82f6',fillOpacity:1}).addTo(map);
+  var camLayer = L.layerGroup().addTo(map);
+  var cams = [];
+  var seen = {};
+  var lastFetch = null;
+  var lastPos = null;
+  var heading = null;
+  var follow = true;
+  var soundOn = true, voiceOn = true;
+  var announced = {};           // id -> kleinste bereits gewarnte Stufe
+  var watchId = null, wakeLock = null, audioCtx = null;
+
+  map.on('dragstart',function(){follow=false;});
+
+  function dist(a,b,c,d){
+    var R=6371000,r=Math.PI/180;
+    var dLat=(c-a)*r,dLon=(d-b)*r;
+    var x=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(a*r)*Math.cos(c*r)*Math.sin(dLon/2)*Math.sin(dLon/2);
+    return 2*R*Math.asin(Math.sqrt(x));
+  }
+  function bearing(a,b,c,d){
+    var r=Math.PI/180,y=Math.sin((d-b)*r)*Math.cos(c*r);
+    var x=Math.cos(a*r)*Math.sin(c*r)-Math.sin(a*r)*Math.cos(c*r)*Math.cos((d-b)*r);
+    return (Math.atan2(y,x)/r+360)%360;
+  }
+  function angDiff(a,b){var d=Math.abs(a-b)%360;return d>180?360-d:d;}
+
+  // Audio auf iOS freischalten (muss durch Tippen ausgelöst werden)
+  function unlockAudio(){
+    try{
+      audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+      if(audioCtx.state==='suspended')audioCtx.resume();
+      var o=audioCtx.createOscillator(),g=audioCtx.createGain();
+      g.gain.value=0;o.connect(g);g.connect(audioCtx.destination);
+      o.start();o.stop(audioCtx.currentTime+0.01);
+    }catch(e){}
+    try{
+      if(window.speechSynthesis){
+        var u=new SpeechSynthesisUtterance(' ');u.volume=0;u.lang='de-DE';
+        speechSynthesis.speak(u);
+      }
+    }catch(e){}
+  }
+
+  // 500 m = 1 Ton, 150 m = 2 Töne, 50 m = 3 schnelle, höhere Töne
+  function beep(level){
+    if(!soundOn)return;
+    try{
+      audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+      if(audioCtx.state==='suspended')audioCtx.resume();
+      var n=level===500?1:level===150?2:3;
+      var freq=level===500?800:level===150?1000:1300;
+      var gap=level===50?0.18:0.28;
+      for(var i=0;i<n;i++){
+        var t=audioCtx.currentTime+i*gap;
+        var o=audioCtx.createOscillator(),g=audioCtx.createGain();
+        o.type='square';o.frequency.value=freq;
+        o.connect(g);g.connect(audioCtx.destination);
+        g.gain.setValueAtTime(0.35,t);
+        g.gain.setValueAtTime(0,t+0.12);
+        o.start(t);o.stop(t+0.13);
+      }
+    }catch(e){}
+  }
+  function speak(t){
+    if(!voiceOn||!window.speechSynthesis)return;
+    try{
+      var u=new SpeechSynthesisUtterance(t);u.lang='de-DE';u.rate=1.05;
+      speechSynthesis.cancel();speechSynthesis.speak(u);
+    }catch(e){}
+  }
+  function vibrate(level){
+    if(!navigator.vibrate)return;
+    navigator.vibrate(level===500?[200]:level===150?[200,100,200]:[200,100,200,100,200]);
+  }
+
+  async function fetchCams(lat,lon){
+    var q='[out:json][timeout:25];(node["highway"="speed_camera"](around:'+RADIUS+','+lat+','+lon+');node["enforcement"="maxspeed"](around:'+RADIUS+','+lat+','+lon+'););out body;';
+    for(var i=0;i<OVERPASS.length;i++){
+      try{
+        var res=await fetch(OVERPASS[i],{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+        if(!res.ok)continue;
+        var j=await res.json();
+        j.elements.forEach(function(e){
+          if(seen[e.id])return;
+          seen[e.id]=true;
+          var c={id:e.id,lat:e.lat,lon:e.lon,maxspeed:(e.tags&&e.tags.maxspeed)||null};
+          cams.push(c);
+          var icon=L.divIcon({className:'',html:'<div class="cam">📸</div>',iconSize:[24,24]});
+          L.marker([c.lat,c.lon],{icon:icon}).addTo(camLayer).bindPopup('Blitzer'+(c.maxspeed?' – Tempo '+c.maxspeed:''));
+        });
+        lastFetch={lat:lat,lon:lon};
+        return true;
+      }catch(e){}
+    }
+    lastFetch=null; // beim nächsten GPS-Update erneut versuchen
+    $('banner').className='';
+    $('banner').textContent='Blitzerdaten konnten nicht geladen werden';
+    return false;
+  }
+
+  function update(pos){
+    var lat=pos.coords.latitude,lon=pos.coords.longitude;
+    var spdKmh=pos.coords.speed!=null?Math.round(pos.coords.speed*3.6):null;
+    if(pos.coords.heading!=null&&!isNaN(pos.coords.heading)&&spdKmh>5)heading=pos.coords.heading;
+    else if(lastPos&&dist(lastPos.lat,lastPos.lon,lat,lon)>8)heading=bearing(lastPos.lat,lastPos.lon,lat,lon);
+    lastPos={lat:lat,lon:lon};
+
+    $('spd').textContent=spdKmh!=null?spdKmh:'–';
+    meMarker.setLatLng([lat,lon]);
+    if(follow)map.setView([lat,lon],Math.max(map.getZoom(),15));
+
+    if(!lastFetch||dist(lastFetch.lat,lastFetch.lon,lat,lon)>REFETCH){
+      lastFetch={lat:lat,lon:lon}; // Doppelabruf verhindern
+      fetchCams(lat,lon).then(check);
+    }
+    check();
+  }
+
+  function check(){
+    if(!lastPos)return;
+    $('cnt').textContent=cams.length;
+    var best=null,bestD=1e12;
+    var target=null,targetD=1e12,targetLevel=null;
+
+    cams.forEach(function(c){
+      var d=dist(lastPos.lat,lastPos.lon,c.lat,c.lon);
+      if(d<bestD){bestD=d;best=c;}
+      if(d>RESET_DIST){delete announced[c.id];return;}
+      var inFront=heading==null||angDiff(bearing(lastPos.lat,lastPos.lon,c.lat,c.lon),heading)<=CONE;
+      if(!inFront||d>LEVELS[0])return;
+      if(d<targetD){targetD=d;target=c;}
+    });
+
+    $('near').textContent=best?(bestD<1000?Math.round(bestD)+' m':(bestD/1000).toFixed(1)+' km'):'–';
+
+    var b=$('banner');
+    if(!target){
+      b.className='';
+      b.textContent=cams.length?'Keine Blitzer voraus':'Suche Blitzer …';
+      return;
+    }
+
+    // kleinste Stufe, die der Abstand unterschreitet
+    for(var i=0;i<LEVELS.length;i++){if(targetD<=LEVELS[i])targetLevel=LEVELS[i];}
+    b.className='l'+targetLevel;
+    b.textContent='⚠ Blitzer in '+Math.round(targetD)+' m'+(target.maxspeed?' – Tempo '+target.maxspeed:'');
+
+    var prev=announced[target.id]||9999;
+    if(targetLevel<prev){
+      announced[target.id]=targetLevel;
+      beep(targetLevel);
+      vibrate(targetLevel);
+      speak('Achtung, Blitzer in '+targetLevel+' Metern');
+    }
+  }
+
+  async function lockScreen(){
+    try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){}
+  }
+  document.addEventListener('visibilitychange',function(){
+    if(document.visibilityState==='visible'&&watchId!=null)lockScreen();
+  });
+
+  $('start').onclick=function(){
+    if(watchId!=null){
+      navigator.geolocation.clearWatch(watchId);watchId=null;
+      if(wakeLock){wakeLock.release();wakeLock=null;}
+      this.textContent='Start';$('banner').className='';$('banner').textContent='Gestoppt';
+      return;
+    }
+    if(!navigator.geolocation){$('banner').textContent='Kein GPS verfügbar';return;}
+    unlockAudio();
+    this.textContent='Stopp';
+    $('banner').className='';
+    $('banner').textContent='Warte auf GPS …';
+    follow=true;
+    lockScreen();
+    watchId=navigator.geolocation.watchPosition(update,function(e){
+      $('banner').className='';
+      $('banner').textContent=e.code===1?'Standort verweigert – in den Safari-Einstellungen erlauben':'GPS-Fehler: '+e.message;
+    },{enableHighAccuracy:true,maximumAge:1000,timeout:20000});
+  };
+  $('snd').onclick=function(){
+    soundOn=!soundOn;this.textContent='Ton: '+(soundOn?'an':'aus');this.className=soundOn?'':'off';
+    if(soundOn){unlockAudio();beep(500);}
+  };
+  $('voice').onclick=function(){
+    voiceOn=!voiceOn;this.textContent='Sprache: '+(voiceOn?'an':'aus');this.className=voiceOn?'':'off';
+    if(voiceOn){unlockAudio();speak('Sprachwarnung aktiv');}
+  };
+  map.on('dblclick',function(){follow=true;});
+})();
+</script>
+</body>
+</html>
